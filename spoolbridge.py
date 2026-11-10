@@ -17,6 +17,11 @@ How it works (Moonraker API on localhost only, standard library only):
      When a slot macro changes, spoolbridge saves it itself, while the printer
      is not printing, as `SAVE_VARIABLE VARIABLE=<macro lower>__spool_id`.
 
+  5. Moonraker misses purges and charges the wrong spool after a Q2 tool
+     change (see UsageTracker). spoolbridge books the difference per spool
+     directly in Spoolman (PUT /api/v1/spool/<id>/use). Disable with
+     SPOOLBRIDGE_USAGE_CORRECTION=0.
+
 That SAVE_VARIABLE, for its own q2_*__spool_id variables only, is the only
 G-code this script sends. It never touches QIDI variables and never operates
 the box. Python 3.9 compatible.
@@ -35,6 +40,10 @@ MOONRAKER = os.environ.get("SPOOLBRIDGE_MOONRAKER", "http://127.0.0.1:7125").rst
 POLL = float(os.environ.get("SPOOLBRIDGE_POLL", "1.0"))
 # Empty = no Spoolman location fallback. Example: "Q2 " -> location "Q2 slot1".
 LOCATION_PREFIX = os.environ.get("SPOOLBRIDGE_LOCATION_PREFIX", "")
+# 1 = book purges and fix Moonraker's per-spool usage after tool changes (see UsageTracker).
+# Filament path from the toolhead sensor to the nozzle on a Q2, in mm of E.
+SENSOR_TO_NOZZLE = float(os.environ.get("SPOOLBRIDGE_SENSOR_TO_NOZZLE", "67"))
+USAGE_CORRECTION = os.environ.get("SPOOLBRIDGE_USAGE_CORRECTION", "1").strip().lower() not in ("0", "false", "no", "off")
 TIMEOUT = 5
 
 SLOT_MACROS = {
@@ -94,7 +103,8 @@ def to_spool_id(value):
 
 def query_url(macros):
     objs = ["multi_color_controller=box", "save_variables=variables", "webhooks=state",
-            "print_stats=state", "%s=filament_detected" % TOOLHEAD_SENSOR]
+            "print_stats=state", "toolhead=position,estimated_print_time",
+            "%s=filament_detected" % TOOLHEAD_SENSOR]
     objs += ["gcode_macro %s=spool_id" % m for m in macros]
     return MOONRAKER + "/printer/objects/query?" + "&".join(
         urllib.parse.quote(o, safe="=") for o in objs
@@ -202,20 +212,182 @@ def save_variable(var, value):
     http_post_json(MOONRAKER + "/printer/gcode/script", {"script": script})
 
 
-# ---------------------------------------------------------------- Spoolman location (optional)
-class LocationLookup:
-    """Look up spools by Spoolman location; results cached for 60 s."""
+# ---------------------------------------------------------------- Spoolman access
+class Spoolman:
+    """Direct access to the Spoolman server configured in Moonraker."""
 
-    def __init__(self, prefix):
-        self.prefix = prefix
+    def __init__(self):
         self.server = None
-        self.cache = {}
+        self.sync_rate = 5.0
 
     def _server(self):
         if self.server is None:
             cfg = http_get(MOONRAKER + "/server/config")["result"]["config"]
-            self.server = (cfg.get("spoolman") or {}).get("server", "").rstrip("/") or ""
+            sm = cfg.get("spoolman") or {}
+            self.server = sm.get("server", "").rstrip("/") or ""
+            try:
+                self.sync_rate = float(sm.get("sync_rate", 5))
+            except (TypeError, ValueError):
+                pass
         return self.server
+
+    def used_length(self, sid):
+        """Used length (mm) of a spool as Spoolman has it now."""
+        return float(http_get("%s/api/v1/spool/%d" % (self._server(), sid)).get("used_length") or 0.0)
+
+    def use(self, sid, length):
+        """Book `length` mm on a spool (negative gives filament back)."""
+        req = urllib.request.Request(
+            "%s/api/v1/spool/%d/use" % (self._server(), sid),
+            data=json.dumps({"use_length": round(length, 2)}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="PUT",
+        )
+        with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
+            r.read()
+
+    def spools_at(self, location):
+        url = self._server() + "/api/v1/spool?" + urllib.parse.urlencode(
+            {"location": location, "allow_archived": "false"}
+        )
+        return http_get(url)
+
+
+# ---------------------------------------------------------------- usage correction
+class UsageTracker:
+    """Book what really went through the nozzle per spool, including purges.
+
+    Moonraker only books extrusion when the extruder position (E) passes its
+    highest value so far. On a Q2 every tool change first pulls ~160 mm back
+    into the box, so the purge and the start of the next colour stay below that
+    high-water mark: they are booked on no spool at all, while the outgoing
+    spool was charged for the filament that went back into the box.
+
+    spoolbridge therefore keeps its own books per period in which one spool is
+    active:
+      * the period starts at E0;
+      * if the toolhead was empty at the start, the box loads first: the E at
+        which the toolhead sensor first sees filament, plus SENSOR_TO_NOZZLE,
+        is where the filament reaches the nozzle (the load itself is not used);
+      * used = highest E in the period - that start point (purge + print;
+        the unload at the end goes back into the box and does not count).
+    When the period ends, spoolbridge compares this with what Moonraker booked
+    on that spool in the same period (Spoolman used_length plus Moonraker's
+    pending reports) and books the difference.
+    """
+
+    MIN_MM = 0.5         # ignore smaller differences
+    MAX_MM = 50000.0     # more in one period means something odd: skip
+
+    def __init__(self, spoolman, dry_run=False, sensor_to_nozzle=None):
+        self.sm = spoolman
+        self.dry_run = dry_run
+        self.sensor_to_nozzle = SENSOR_TO_NOZZLE if sensor_to_nozzle is None else sensor_to_nozzle
+        self.session = None    # current period, see _start
+        self.closed = []       # finished periods waiting for Moonraker to flush
+        self.last_ept = None   # toolhead.estimated_print_time: drops on a Klipper restart
+
+    def _booked(self, sid, pending):
+        try:
+            return self.sm.used_length(sid) + pending.get(sid, 0.0)
+        except Exception as e:
+            log.warning("usage correction: cannot read spool %s from Spoolman: %s", sid, e)
+            return None
+
+    def _start(self, sid, epos, loaded, pending):
+        l0 = self._booked(sid, pending)
+        # A finished period of the same spool that was not settled yet: settle it
+        # now, then read again so the new period starts after that correction.
+        same = [c for c in self.closed if c["spool"] == sid]
+        for c in same:
+            self.closed.remove(c)
+            self._settle(c, l0)
+        if same and l0 is not None:
+            l0 = self._booked(sid, pending)
+        self.session = {"spool": sid, "e0": epos, "emax": epos, "l0": l0,
+                        "loading": loaded is False, "trigger": None}
+
+    def _close(self):
+        s = self.session
+        self.session = None
+        if s is None or s["l0"] is None:
+            return
+        if s["loading"]:
+            if s["trigger"] is None:
+                used = 0.0   # never reached the toolhead: nothing used
+            else:
+                used = s["emax"] - (s["trigger"] + self.sensor_to_nozzle)
+        else:
+            used = s["emax"] - s["e0"]
+        self.closed.append({"spool": s["spool"], "used": max(0.0, used), "l0": s["l0"],
+                            "at": time.monotonic()})
+
+    def _settle(self, c, l1):
+        if l1 is None:
+            log.warning("usage correction for spool %s skipped (Spoolman unreachable)", c["spool"])
+            return
+        booked = l1 - c["l0"]
+        diff = c["used"] - booked
+        if c["used"] > self.MAX_MM:
+            log.warning("usage correction for spool %s skipped: %.1f mm is implausible",
+                        c["spool"], c["used"])
+            return
+        if abs(diff) < self.MIN_MM:
+            return
+        if self.dry_run:
+            log.info("[dry-run] spool %s: used %.1f mm, Moonraker booked %.1f mm, would book %+.1f mm",
+                     c["spool"], c["used"], booked, diff)
+            return
+        self.sm.use(c["spool"], diff)
+        log.info("spool %s: used %.1f mm, Moonraker booked %.1f mm, corrected %+.1f mm",
+                 c["spool"], c["used"], booked, diff)
+
+    def klipper_restart(self):
+        """Klipper restarts reset E: end the period with what is known so far."""
+        self._close()
+        self.last_ept = None
+
+    def update(self, sid, epos, loaded, ept, pending):
+        """Call once per poll.
+
+        sid: active spool, epos: toolhead E, loaded: toolhead sensor
+        (True/False/None), ept: toolhead.estimated_print_time,
+        pending: Moonraker's pending reports {spool id: mm}.
+        """
+        if epos is None:
+            return
+        if ept is not None and self.last_ept is not None and ept < self.last_ept:
+            self._close()   # Klipper restarted between two polls
+        self.last_ept = ept
+        s = self.session
+        if s is not None and s["spool"] != sid:
+            self._close()
+            s = None
+        if s is None and sid is not None:
+            self._start(sid, epos, loaded, pending)
+            s = self.session
+        if s is not None:
+            if s["loading"] and s["trigger"] is None and loaded:
+                s["trigger"] = epos
+            if epos > s["emax"]:
+                s["emax"] = epos
+        # Settle finished periods once Moonraker has flushed its reports for them.
+        now = time.monotonic()
+        for c in list(self.closed):
+            if c["spool"] in pending or now - c["at"] < 2 * self.sm.sync_rate + 1:
+                continue
+            self.closed.remove(c)
+            self._settle(c, self._booked(c["spool"], pending))
+
+
+# ---------------------------------------------------------------- Spoolman location (optional)
+class LocationLookup:
+    """Look up spools by Spoolman location; results cached for 60 s."""
+
+    def __init__(self, prefix, spoolman=None):
+        self.prefix = prefix
+        self.sm = spoolman or Spoolman()
+        self.cache = {}
 
     def __call__(self, slot):
         name = self.prefix + LOCATION_NAMES.get(slot, slot)
@@ -224,12 +396,8 @@ class LocationLookup:
             return hit[0]
         sid = None
         try:
-            server = self._server()
-            if server:
-                url = server + "/api/v1/spool?" + urllib.parse.urlencode(
-                    {"location": name, "allow_archived": "false"}
-                )
-                spools = http_get(url)
+            if self.sm._server():
+                spools = self.sm.spools_at(name)
                 if isinstance(spools, list) and len(spools) == 1:
                     sid = to_spool_id(spools[0].get("id"))
                 elif isinstance(spools, list) and len(spools) > 1:
@@ -241,9 +409,19 @@ class LocationLookup:
 
 
 # ---------------------------------------------------------------- main loop
-def get_active_spool():
+def get_spoolman_status():
+    """Return (active spool id, {spool id: pending mm}) from Moonraker."""
     res = http_get(MOONRAKER + "/server/spoolman/status")["result"]
-    return to_spool_id(res.get("spool_id"))
+    pending = {}
+    for p in res.get("pending_reports") or []:
+        sid = to_spool_id(p.get("spool_id"))
+        if sid:
+            pending[sid] = pending.get(sid, 0.0) + float(p.get("filament_used") or 0.0)
+    return to_spool_id(res.get("spool_id")), pending
+
+
+def get_active_spool():
+    return get_spoolman_status()[0]
 
 
 def set_active_spool(sid):
@@ -253,9 +431,12 @@ def set_active_spool(sid):
     http_post_json(MOONRAKER + "/server/spoolman/spool_id", payload)
 
 
-def run(dry_run=False, once=False, persister=None):
-    lookup = LocationLookup(LOCATION_PREFIX) if LOCATION_PREFIX else None
+def run(dry_run=False, once=False, persister=None, tracker=None):
+    spoolman = Spoolman()
+    lookup = LocationLookup(LOCATION_PREFIX, spoolman) if LOCATION_PREFIX else None
     persister = persister if persister is not None else Persister()
+    if tracker is None and USAGE_CORRECTION:
+        tracker = UsageTracker(spoolman, dry_run)
     macros = sorted(set(SLOT_MACROS.values()))
     url = query_url(macros)
     last_key = None   # last logged state
@@ -266,6 +447,8 @@ def run(dry_run=False, once=False, persister=None):
             data = http_get(url)["result"]["status"]
             if (data.get("webhooks") or {}).get("state") != "ready":
                 persister.reset()
+                if tracker is not None:
+                    tracker.klipper_restart()
                 raise RuntimeError("Klipper not ready")
             persister.observe(data)
             busy = (data.get("print_stats") or {}).get("state") in BUSY_STATES
@@ -282,7 +465,7 @@ def run(dry_run=False, once=False, persister=None):
                         log.info("saved %s = %s (Fluidd selection)", var, value)
                     persister.done(var)
             slot, want, why = resolve(data, lookup, persister.cleared())
-            have = get_active_spool()
+            have, pending = get_spoolman_status()
             key = (slot, want, have)
             changed = key != last_key
             if changed:
@@ -295,6 +478,13 @@ def run(dry_run=False, once=False, persister=None):
                 else:
                     set_active_spool(want)
                     log.info("active spool set to %s", want)
+                    have = want
+            if tracker is not None:
+                th = data.get("toolhead") or {}
+                pos = th.get("position") or []
+                epos = float(pos[3]) if len(pos) > 3 and pos[3] is not None else None
+                sensor = (data.get(TOOLHEAD_SENSOR) or {}).get("filament_detected")
+                tracker.update(have, epos, sensor, th.get("estimated_print_time"), pending)
         except urllib.error.HTTPError as e:
             body = ""
             try:
@@ -320,8 +510,8 @@ def main():
     p.add_argument("--once", action="store_true", help="check once and exit")
     a = p.parse_args()
     logging.basicConfig(level=logging.INFO, stream=sys.stdout, format="%(levelname)s %(message)s")
-    log.info("spoolbridge started: moonraker=%s poll=%ss location-prefix=%r dry-run=%s",
-             MOONRAKER, POLL, LOCATION_PREFIX, a.dry_run)
+    log.info("spoolbridge started: moonraker=%s poll=%ss location-prefix=%r usage-correction=%s dry-run=%s",
+             MOONRAKER, POLL, LOCATION_PREFIX, USAGE_CORRECTION, a.dry_run)
     run(dry_run=a.dry_run, once=a.once)
 
 

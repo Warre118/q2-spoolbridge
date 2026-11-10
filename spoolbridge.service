@@ -10,6 +10,9 @@ Environment=SPOOLBRIDGE_MOONRAKER=http://127.0.0.1:7125
 Environment=SPOOLBRIDGE_POLL=1.0
 # Set e.g. "Q2 " to use Spoolman locations ("Q2 slot1") as a fallback.
 Environment=SPOOLBRIDGE_LOCATION_PREFIX=
+# Book purges and fix per-spool usage after tool changes (0 = off).
+Environment=SPOOLBRIDGE_USAGE_CORRECTION=1
+Environment=SPOOLBRIDGE_SENSOR_TO_NOZZLE=67
 Restart=always
 RestartSec=10
 
