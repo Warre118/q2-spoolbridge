@@ -2,9 +2,9 @@
 
 **Spoolman-integratie voor de QIDI Q2 met QIDI Box die werkt met de nieuwe firmware (01.01.03.x).**
 
-spoolbridge zet automatisch de juiste spoel actief in Moonraker, op basis van het slot dat de QIDI Box geladen heeft. Moonraker meet dan zelf het verbruik en meldt het aan Spoolman. Je koppelt per box-slot een spoel in Fluidd, zoals vroeger.
+spoolbridge zet automatisch de juiste spoel actief in Moonraker, op basis van het slot dat de QIDI Box geladen heeft. Je koppelt per box-slot een spoel in Fluidd, zoals vroeger. Moonraker meet het verbruik zoals altijd, en spoolbridge boekt wat Moonraker rond een toolwissel fout doet (purges, het terugtrekken naar de box) op de juiste spoel.
 
-> **Status: beta.** Getest op een Q2 met één QIDI Box, firmware 01.01.03.x. Nog niet bevestigd: of `loaded_slot` bij elke wissel in een meerkleurenprint precies verandert. Meld je ervaring in de issues.
+> **Status: beta.** Getest op een Q2 met één QIDI Box, firmware 01.01.03.x, in meerkleurenprints: de actieve spoel volgt elke wissel. De verbruikscorrectie is tot nu toe op één print vergeleken met de slicerwaarden per filament. Meld je ervaring in de issues.
 
 ## Waarom
 

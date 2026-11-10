@@ -2,9 +2,9 @@
 
 **Spoolman integration for the QIDI Q2 with QIDI Box that works with the new firmware (01.01.03.x).**
 
-spoolbridge automatically sets the right spool as active in Moonraker, based on the slot the QIDI Box has loaded. Moonraker then tracks filament usage and reports it to Spoolman as usual. You assign a spool to each box slot in Fluidd, just like before.
+spoolbridge automatically sets the right spool as active in Moonraker, based on the slot the QIDI Box has loaded. You assign a spool to each box slot in Fluidd, just like before. Moonraker tracks usage as usual, and spoolbridge books what Moonraker gets wrong around tool changes (purges, the retract into the box) on the right spool.
 
-> **Status: beta.** Tested on a Q2 with one QIDI Box, firmware 01.01.03.x. Not yet confirmed: whether `loaded_slot` changes exactly at every tool change in a multi-colour print. Please report your results in the issues.
+> **Status: beta.** Tested on a Q2 with one QIDI Box, firmware 01.01.03.x, in multi-colour prints: the active spool follows every tool change. The usage correction was checked against the slicer's per-filament totals on one print so far. Please report your results in the issues.
 
 ## Why
 
