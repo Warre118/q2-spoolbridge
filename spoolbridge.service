@@ -12,7 +12,7 @@ Environment=SPOOLBRIDGE_POLL=1.0
 Environment=SPOOLBRIDGE_LOCATION_PREFIX=
 # Book purges and fix per-spool usage after tool changes (0 = off).
 Environment=SPOOLBRIDGE_USAGE_CORRECTION=1
-Environment=SPOOLBRIDGE_SENSOR_TO_NOZZLE=67
+Environment=SPOOLBRIDGE_LOAD_OFFSET=67
 Restart=always
 RestartSec=10
 

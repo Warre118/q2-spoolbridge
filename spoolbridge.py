@@ -41,8 +41,10 @@ POLL = float(os.environ.get("SPOOLBRIDGE_POLL", "1.0"))
 # Empty = no Spoolman location fallback. Example: "Q2 " -> location "Q2 slot1".
 LOCATION_PREFIX = os.environ.get("SPOOLBRIDGE_LOCATION_PREFIX", "")
 # 1 = book purges and fix Moonraker's per-spool usage after tool changes (see UsageTracker).
-# Filament path from the toolhead sensor to the nozzle on a Q2, in mm of E.
-SENSOR_TO_NOZZLE = float(os.environ.get("SPOOLBRIDGE_SENSOR_TO_NOZZLE", "67"))
+# mm of E between the toolhead sensor seeing a new filament and the point where
+# it starts to count as used (its tip at the cutter, see UsageTracker).
+# Measured on a Q2 against the slicer's per-filament totals.
+LOAD_OFFSET = float(os.environ.get("SPOOLBRIDGE_LOAD_OFFSET", "67"))
 USAGE_CORRECTION = os.environ.get("SPOOLBRIDGE_USAGE_CORRECTION", "1").strip().lower() not in ("0", "false", "no", "off")
 TIMEOUT = 5
 
@@ -263,14 +265,26 @@ class UsageTracker:
     high-water mark: they are booked on no spool at all, while the outgoing
     spool was charged for the filament that went back into the box.
 
+    A Q2 tool change: (ramming,) cut, retract ~160 mm, box rewinds; then the
+    new filament is loaded and purged. The cut leaves a piece of the OLD
+    filament between cutter and nozzle; the purge of the new filament pushes
+    it out. What a spool really loses is everything that went past the cutter
+    while it was loaded: what it printed and purged plus the piece left behind
+    at its own cut. The new filament pushing out the old piece does not cost
+    the new spool anything (its own tip is still behind the cutter).
+
     spoolbridge therefore keeps its own books per period in which one spool is
     active:
       * the period starts at E0;
-      * if the toolhead was empty at the start, the box loads first: the E at
-        which the toolhead sensor first sees filament, plus SENSOR_TO_NOZZLE,
-        is where the filament reaches the nozzle (the load itself is not used);
-      * used = highest E in the period - that start point (purge + print;
-        the unload at the end goes back into the box and does not count).
+      * if the toolhead was empty at the start, the box loads first. The spool
+        starts to count once its tip passes the cutter: the E at which the
+        toolhead sensor first sees filament, plus LOAD_OFFSET;
+      * it stops counting at the cut, just before the big retract. That point
+        is taken as the highest E in the period; the small ramming retract
+        before the cut is part of LOAD_OFFSET, which was measured end to end
+        against the slicer's per-filament totals;
+      * used = highest E - start point. The retract and unload after the cut
+        go back into the box and do not count.
     When the period ends, spoolbridge compares this with what Moonraker booked
     on that spool in the same period (Spoolman used_length plus Moonraker's
     pending reports) and books the difference.
@@ -279,10 +293,10 @@ class UsageTracker:
     MIN_MM = 0.5         # ignore smaller differences
     MAX_MM = 50000.0     # more in one period means something odd: skip
 
-    def __init__(self, spoolman, dry_run=False, sensor_to_nozzle=None):
+    def __init__(self, spoolman, dry_run=False, load_offset=None):
         self.sm = spoolman
         self.dry_run = dry_run
-        self.sensor_to_nozzle = SENSOR_TO_NOZZLE if sensor_to_nozzle is None else sensor_to_nozzle
+        self.load_offset = LOAD_OFFSET if load_offset is None else load_offset
         self.session = None    # current period, see _start
         self.closed = []       # finished periods waiting for Moonraker to flush
         self.last_ept = None   # toolhead.estimated_print_time: drops on a Klipper restart
@@ -316,7 +330,7 @@ class UsageTracker:
             if s["trigger"] is None:
                 used = 0.0   # never reached the toolhead: nothing used
             else:
-                used = s["emax"] - (s["trigger"] + self.sensor_to_nozzle)
+                used = s["emax"] - (s["trigger"] + self.load_offset)
         else:
             used = s["emax"] - s["e0"]
         self.closed.append({"spool": s["spool"], "used": max(0.0, used), "l0": s["l0"],

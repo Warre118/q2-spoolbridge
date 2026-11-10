@@ -210,35 +210,35 @@ TRACE = ([(4, False, 0.0), (4, True, 25.0), (4, True, 164.0), (4, True, 307.0), 
           (7, True, 302.7), (7, True, 307.7), (7, True, 317.5), (7, True, 325.5), (7, False, 164.0)] +
          [(None, False, 164.0), (None, False, 164.0)])
 sm = FakeSpoolman()
-tr = sb.UsageTracker(sm, sensor_to_nozzle=67.0)
+tr = sb.UsageTracker(sm, load_offset=67.0)
 replay(TRACE, sm, tr)
 check("Moonraker alone would book 4:334.3, 7:0", True, True)
 check("corrections: 4 gets load back, 7 gets purge + print", sm.uses, [(4, -92.0), (7, 60.7)])
 check("spool 7 ends at the slicer's ~60 mm", round(sm.used[7], 1), 60.7)
 
 sm = FakeSpoolman()
-tr = sb.UsageTracker(sm, sensor_to_nozzle=67.0)
+tr = sb.UsageTracker(sm, load_offset=67.0)
 replay([(5, True, 100.0), (5, True, 150.0), (5, True, 148.0), (None, True, 148.0), (None, True, 148.0)], sm, tr, 100.0)
 check("already loaded, Moonraker right: no correction", sm.uses, [])
 
 sm = FakeSpoolman()
-tr = sb.UsageTracker(sm, sensor_to_nozzle=67.0)
+tr = sb.UsageTracker(sm, load_offset=67.0)
 replay([(5, False, 10.0), (5, False, 10.0), (None, False, 10.0), (None, False, 10.0)], sm, tr)
 check("never reached the toolhead: nothing booked", sm.uses, [])
 
 sm = FakeSpoolman()
-tr = sb.UsageTracker(sm, dry_run=True, sensor_to_nozzle=67.0)
+tr = sb.UsageTracker(sm, dry_run=True, load_offset=67.0)
 replay(TRACE, sm, tr)
 check("dry-run: no corrections written", sm.uses, [])
 
 sm = FakeSpoolman()
 sm.down = True
-tr = sb.UsageTracker(sm, sensor_to_nozzle=67.0)
+tr = sb.UsageTracker(sm, load_offset=67.0)
 replay(TRACE, sm, tr)
 check("Spoolman unreachable: skip, never guess", sm.uses, [])
 
 sm = FakeSpoolman()
-tr = sb.UsageTracker(sm, sensor_to_nozzle=67.0)
+tr = sb.UsageTracker(sm, load_offset=67.0)
 replay([(4, True, 0.0), (4, True, 50.0)], sm, tr)
 tr.klipper_restart()
 tr.update(4, 0.0, True, 0.5, {})
@@ -247,7 +247,7 @@ tr.update(None, 0.0, True, 1.5, {})
 check("Klipper restart: period closed with what was known", sm.uses, [])
 
 sm = FakeSpoolman()
-tr = sb.UsageTracker(sm, sensor_to_nozzle=67.0)
+tr = sb.UsageTracker(sm, load_offset=67.0)
 replay([(4, True, 200.0), (4, True, 260.0)], sm, tr, 300.0)
 tr.update(4, 5.0, True, 0.2, {})          # print time dropped: Klipper restarted unseen
 tr.update(None, 5.0, True, 0.3, {})
