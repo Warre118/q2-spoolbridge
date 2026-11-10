@@ -12,10 +12,14 @@ How it works (Moonraker API on localhost only, standard library only):
   3. If it differs from Moonraker's active spool, call
      POST /server/spoolman/spool_id. No spool found -> clear the active spool,
      so usage is never booked on the wrong spool.
+  4. Fluidd 1.30.x saves spool selections under an upper-case name, which
+     Klipper's save_variables rejects, so the selection is lost on restart.
+     When a slot macro changes, spoolbridge saves it itself, while the printer
+     is not printing, as `SAVE_VARIABLE VARIABLE=<macro lower>__spool_id`.
 
-This script never sends G-code, never touches Klipper variables and never
-operates the box. The only thing it writes is Moonraker's active spool.
-Python 3.9 compatible.
+That SAVE_VARIABLE, for its own q2_*__spool_id variables only, is the only
+G-code this script sends. It never touches QIDI variables and never operates
+the box. Python 3.9 compatible.
 """
 import argparse
 import json
@@ -90,15 +94,19 @@ def to_spool_id(value):
 
 def query_url(macros):
     objs = ["multi_color_controller=box", "save_variables=variables", "webhooks=state",
-            "%s=filament_detected" % TOOLHEAD_SENSOR]
+            "print_stats=state", "%s=filament_detected" % TOOLHEAD_SENSOR]
     objs += ["gcode_macro %s=spool_id" % m for m in macros]
     return MOONRAKER + "/printer/objects/query?" + "&".join(
         urllib.parse.quote(o, safe="=") for o in objs
     )
 
 
-def resolve(status, location_lookup=None):
-    """Return (loaded_slot, spool_id or None, reason) from an objects query."""
+def resolve(status, location_lookup=None, cleared=()):
+    """Return (loaded_slot, spool_id or None, reason) from an objects query.
+
+    `cleared`: macros the user emptied in Fluidd this session; those must not
+    fall back to the (stale) saved_variables value.
+    """
     box = (status.get("multi_color_controller") or {}).get("box") or {}
     slot = box.get("loaded_slot")
     if not isinstance(slot, str) or slot not in SLOT_MACROS:
@@ -113,7 +121,9 @@ def resolve(status, location_lookup=None):
         sid = to_spool_id(mstat.get("spool_id"))
         if sid:
             return slot, sid, "macro " + macro
-    svv = (status.get("save_variables") or {}).get("variables") or {}
+        if macro in cleared:
+            return slot, None, "spool cleared in Fluidd for " + macro
+    svv =(status.get("save_variables") or {}).get("variables") or {}
     sid = to_spool_id(svv.get(macro.lower() + "__spool_id"))
     if sid:
         return slot, sid, "saved_variables " + macro.lower() + "__spool_id"
@@ -122,6 +132,74 @@ def resolve(status, location_lookup=None):
         if sid:
             return slot, sid, "Spoolman location"
     return slot, None, "no spool assigned to " + macro
+
+
+# ---------------------------------------------------------------- persist Fluidd selections
+BUSY_STATES = ("printing", "paused")
+
+
+class Persister:
+    """Track the slot macros and save changed selections to saved_variables.
+
+    Fluidd 1.30.x tries `SAVE_VARIABLE VARIABLE=Q2_SLOT2__SPOOL_ID ...`, which
+    Klipper rejects (upper case), so only the macro holds the new value.
+    The first value seen per Klipper session is the baseline (that is what the
+    restore macro put there); only later changes count as a user selection.
+    """
+
+    RETRY = 60           # seconds to wait after a failed save
+
+    def __init__(self):
+        self.baseline = {}   # macro -> spool id (or None) last seen
+        self.dirty = set()   # macros changed by the user, not yet saved
+        self.hold_until = 0.0
+
+    def reset(self):
+        """Klipper restarted: macros are reloaded, start over."""
+        self.baseline.clear()
+        self.dirty.clear()
+
+    def observe(self, status):
+        for macro in set(SLOT_MACROS.values()):
+            mstat = status.get("gcode_macro " + macro)
+            if mstat is None:
+                continue
+            value = to_spool_id(mstat.get("spool_id"))
+            if macro not in self.baseline:
+                self.baseline[macro] = value
+                # A spool id in the macro that saved_variables does not have
+                # can only come from Fluidd: save it. (An empty macro may just
+                # mean the restore macro has not run yet: ignore that.)
+                svv = (status.get("save_variables") or {}).get("variables") or {}
+                if value is not None and value != to_spool_id(svv.get(macro.lower() + "__spool_id")):
+                    self.dirty.add(macro)
+            elif value != self.baseline[macro]:
+                self.baseline[macro] = value
+                self.dirty.add(macro)
+
+    def cleared(self):
+        return {m for m in self.dirty if self.baseline.get(m) is None}
+
+    def pending(self, status):
+        """Return [(variable, value)] that still has to be saved."""
+        svv = (status.get("save_variables") or {}).get("variables") or {}
+        out = []
+        for macro in sorted(self.dirty):
+            var = macro.lower() + "__spool_id"
+            value = self.baseline.get(macro)
+            if to_spool_id(svv.get(var)) == value:
+                self.dirty.discard(macro)   # already saved (e.g. newer Fluidd)
+            else:
+                out.append((var, value))
+        return out
+
+    def done(self, var):
+        self.dirty = {m for m in self.dirty if m.lower() + "__spool_id" != var}
+
+
+def save_variable(var, value):
+    script = "SAVE_VARIABLE VARIABLE=%s VALUE=%s" % (var, value if value is not None else "None")
+    http_post_json(MOONRAKER + "/printer/gcode/script", {"script": script})
 
 
 # ---------------------------------------------------------------- Spoolman location (optional)
@@ -175,8 +253,9 @@ def set_active_spool(sid):
     http_post_json(MOONRAKER + "/server/spoolman/spool_id", payload)
 
 
-def run(dry_run=False, once=False):
+def run(dry_run=False, once=False, persister=None):
     lookup = LocationLookup(LOCATION_PREFIX) if LOCATION_PREFIX else None
+    persister = persister if persister is not None else Persister()
     macros = sorted(set(SLOT_MACROS.values()))
     url = query_url(macros)
     last_key = None   # last logged state
@@ -186,8 +265,23 @@ def run(dry_run=False, once=False):
         try:
             data = http_get(url)["result"]["status"]
             if (data.get("webhooks") or {}).get("state") != "ready":
+                persister.reset()
                 raise RuntimeError("Klipper not ready")
-            slot, want, why = resolve(data, lookup)
+            persister.observe(data)
+            busy = (data.get("print_stats") or {}).get("state") in BUSY_STATES
+            if not busy and time.monotonic() >= persister.hold_until:
+                for var, value in persister.pending(data):
+                    if dry_run:
+                        log.info("[dry-run] would save %s = %s", var, value)
+                    else:
+                        try:
+                            save_variable(var, value)
+                        except Exception:
+                            persister.hold_until = time.monotonic() + persister.RETRY
+                            raise
+                        log.info("saved %s = %s (Fluidd selection)", var, value)
+                    persister.done(var)
+            slot, want, why = resolve(data, lookup, persister.cleared())
             have = get_active_spool()
             key = (slot, want, have)
             changed = key != last_key

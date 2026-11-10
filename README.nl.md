@@ -10,7 +10,7 @@ spoolbridge zet automatisch de juiste spoel actief in Moonraker, op basis van he
 
 Sinds de recente QIDI-firmware loopt elke toolwissel via QIDI's `T_MANAGER`. De gangbare aanpak overschrijft `T0`–`T3` met eigen macro's die `EXTRUDER_LOAD` rechtstreeks aanroepen. Dat slaat QIDI's administratie over, waardoor **de box uit sync raakt** met de printer.
 
-spoolbridge raakt de toolwissel niet aan. Het **kijkt alleen** naar `multi_color_controller.box.loaded_slot` via de Moonraker-API en zet de actieve spoel. Het stuurt nooit G-code, overschrijft geen QIDI-macro's en bedient de box niet. Het volgt ook auto-refill, omdat het naar het geladen slot kijkt en niet naar het T-nummer.
+spoolbridge raakt de toolwissel niet aan. Het **kijkt alleen** naar `multi_color_controller.box.loaded_slot` via de Moonraker-API en zet de actieve spoel. Het overschrijft geen QIDI-macro's en bedient de box niet. De enige G-code die het stuurt is `SAVE_VARIABLE` voor zijn eigen `q2_*__spool_id`-variabelen (zie hieronder). Het volgt ook auto-refill, omdat het naar het geladen slot kijkt en niet naar het T-nummer.
 
 ## Installeren (als mks)
 
@@ -42,7 +42,7 @@ Je kunt het gerust opnieuw uitvoeren.
 ## Slot koppelen aan een spoel
 
 1. Open in Fluidd de Spoolman-kaart. Elke slotmacro (`Q2_SLOT1` … `Q2_SLOT4`, `Q2_EXTERN`) krijgt een spoelkiezer.
-2. Kies per slot de spoel. Fluidd bewaart dat in `saved_variables.cfg`, dus het overleeft een herstart.
+2. Kies per slot de spoel. spoolbridge bewaart dat in `saved_variables.cfg`, dus het overleeft een herstart.
 3. Laadt de box `slot0`, dan wordt de spoel van `Q2_SLOT1` actief, enzovoort.
 
 | Box-slot | Macro | Op het scherm |
@@ -57,6 +57,8 @@ Je kunt het gerust opnieuw uitvoeren.
 - De box laadt filament pas in de toolhead bij de printstart of een wissel. Op dat moment wisselt de actieve spoel.
 - Is het geladen slot niet gekoppeld, dan maakt spoolbridge de actieve spoel **leeg**.
 - Het slot is leidend: een handmatig gekozen spoel zet spoolbridge binnen een seconde terug.
+- **Fluidd 1.30.x-bug:** de Fluidd die QIDI meelevert slaat een spoelkeuze op als `Q2_SLOT2__SPOOL_ID` (hoofdletters). Klipper weigert dat, dus na een herstart is de keuze weg ([upstream opgelost in fluidd#1563](https://github.com/fluidd-core/fluidd/pull/1563)). spoolbridge vangt dat op zonder Fluidd te patchen: verandert een slotmacro, dan slaat het zelf `SAVE_VARIABLE VARIABLE=q2_slot2__spool_id VALUE=<id>` op, maar alleen als de printer niet print of gepauzeerd is. Met een gerepareerde Fluidd ziet het dat de waarde al bewaard is en doet het niets.
+- Een slot leegmaken in Fluidd maakt het echt leeg: spoolbridge valt niet terug op de oude bewaarde waarde.
 - Logs: `sudo journalctl -u spoolbridge -f`
 - Verwijderen: `bash /opt/spoolbridge/install.sh --uninstall`
 

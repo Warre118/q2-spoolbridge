@@ -27,8 +27,9 @@ def check(name, got, want):
     print("PASS" if ok else "FAIL", name, "->", got, "" if ok else "(expected %r)" % (want,))
 
 
-def st(slot=None, macros=None, svv=None, sensor=None):
+def st(slot=None, macros=None, svv=None, sensor=None, print_state="standby"):
     s = copy.deepcopy(BASE)
+    s["print_stats"] = {"state": print_state}
     if slot is not None:
         s["multi_color_controller"]["box"]["loaded_slot"] = slot
     for m, v in (macros or {}).items():
@@ -68,7 +69,13 @@ def fake_get(url):
     return {"result": {"status": seq.pop(0)}}
 
 
+scripts = []
+
+
 def fake_post(url, payload):
+    if url.endswith("/printer/gcode/script"):
+        scripts.append(payload["script"])
+        return {"result": "ok"}
     # Behaves like Moonraker: null is rejected, leaving the key out clears.
     payloads.append(payload)
     if "spool_id" in payload and payload["spool_id"] is None:
@@ -97,6 +104,74 @@ payloads.clear()
 seq[:] = [st("slot16")]
 sb.run(once=True)
 check("clearing sends {} and succeeds", (payloads, active["id"]), ([{}], None))
+
+# --- persisting Fluidd selections (Fluidd 1.30.x upper-case bug)
+def rounds(states, p):
+    scripts.clear()
+    seq[:] = list(states)
+    for _ in states:
+        sb.run(once=True, persister=p)
+    return list(scripts)
+
+
+SV = "SAVE_VARIABLE VARIABLE=q2_slot2__spool_id VALUE="
+p = sb.Persister()
+check("restored macro == saved: no save",
+      rounds([st("slot1", {"Q2_SLOT2": 6}, {"q2_slot2__spool_id": 6})] * 2, p), [])
+check("macro 6 -> 4 while idle: saved lower case",
+      rounds([st("slot1", {"Q2_SLOT2": 4}, {"q2_slot2__spool_id": 6})], p), [SV + "4"])
+check("saved only once", rounds([st("slot1", {"Q2_SLOT2": 4}, {"q2_slot2__spool_id": 4})], p), [])
+
+p = sb.Persister()
+rounds([st("slot1", {"Q2_SLOT2": 6}, {"q2_slot2__spool_id": 6}, print_state="printing")], p)
+check("change while printing: wait",
+      rounds([st("slot1", {"Q2_SLOT2": 4}, {"q2_slot2__spool_id": 6}, print_state="printing")], p), [])
+check("print done: save now",
+      rounds([st("slot1", {"Q2_SLOT2": 4}, {"q2_slot2__spool_id": 6}, print_state="complete")], p), [SV + "4"])
+
+p = sb.Persister()
+check("start with unsaved Fluidd value: save",
+      rounds([st("slot1", {"Q2_SLOT2": 4}, {"q2_slot2__spool_id": 6})], p), [SV + "4"])
+
+p = sb.Persister()
+s0 = st("slot1", {"Q2_SLOT2": None}, {"q2_slot2__spool_id": 6})
+check("empty macro before restore: no save", rounds([s0], p), [])
+check("empty macro before restore: use saved", sb.resolve(s0, None, p.cleared())[1], 6)
+
+p = sb.Persister()
+rounds([st("slot1", {"Q2_SLOT2": 6}, {"q2_slot2__spool_id": 6})], p)
+s1 = st("slot1", {"Q2_SLOT2": None}, {"q2_slot2__spool_id": 6}, print_state="printing")
+rounds([s1], p)
+check("cleared in Fluidd: no fallback to stale saved value", sb.resolve(s1, None, p.cleared())[1], None)
+check("cleared: saved as None after print",
+      rounds([st("slot1", {"Q2_SLOT2": None}, {"q2_slot2__spool_id": 6})], p), [SV + "None"])
+
+p = sb.Persister()
+rounds([st("slot1", {"Q2_SLOT2": 6}, {"q2_slot2__spool_id": 6}), st("slot1", {"Q2_SLOT2": 4}, {"q2_slot2__spool_id": 6}, print_state="printing")], p)
+rounds([dict(st("slot1"), webhooks={"state": "startup"})], p)
+check("Klipper restart resets pending changes",
+      rounds([st("slot1", {"Q2_SLOT2": None}, {"q2_slot2__spool_id": 6})], p), [])
+
+p = sb.Persister()
+check("dry-run: no save sent", (seq.__setitem__(slice(None), [st("slot1", {"Q2_SLOT2": 4}, {"q2_slot2__spool_id": 6})]),
+                                sb.run(dry_run=True, once=True, persister=p), scripts[:])[2], [])
+
+# failed save: hold off, no retry every second
+real_post = sb.http_post_json
+
+
+def failing_post(url, payload):
+    if url.endswith("/printer/gcode/script"):
+        scripts.append("FAIL")
+        raise urllib.error.HTTPError(url, 500, "err", {}, io.BytesIO(b"x"))
+    return real_post(url, payload)
+
+
+sb.http_post_json = failing_post
+p = sb.Persister()
+check("failed save is not retried at once",
+      rounds([st("slot1", {"Q2_SLOT2": 4}, {"q2_slot2__spool_id": 6})] * 3, p), ["FAIL"])
+sb.http_post_json = real_post
 
 # --- an error is logged only once
 records = []
