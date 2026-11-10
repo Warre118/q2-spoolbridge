@@ -1,0 +1,67 @@
+# q2-spoolbridge (Nederlands)
+
+**Spoolman-integratie voor de QIDI Q2 met QIDI Box die werkt met de nieuwe firmware (01.01.03.x).**
+
+spoolbridge zet automatisch de juiste spoel actief in Moonraker, op basis van het slot dat de QIDI Box geladen heeft. Moonraker meet dan zelf het verbruik en meldt het aan Spoolman. Je koppelt per box-slot een spoel in Fluidd, zoals vroeger.
+
+> **Status: beta.** Getest op een Q2 met één QIDI Box, firmware 01.01.03.x. Nog niet bevestigd: of `loaded_slot` bij elke wissel in een meerkleurenprint precies verandert. Meld je ervaring in de issues.
+
+## Waarom
+
+Sinds de recente QIDI-firmware loopt elke toolwissel via QIDI's `T_MANAGER`. De gangbare aanpak overschrijft `T0`–`T3` met eigen macro's die `EXTRUDER_LOAD` rechtstreeks aanroepen. Dat slaat QIDI's administratie over, waardoor **de box uit sync raakt** met de printer.
+
+spoolbridge raakt de toolwissel niet aan. Het **kijkt alleen** naar `multi_color_controller.box.loaded_slot` via de Moonraker-API en zet de actieve spoel. Het stuurt nooit G-code, overschrijft geen QIDI-macro's en bedient de box niet. Het volgt ook auto-refill, omdat het naar het geladen slot kijkt en niet naar het T-nummer.
+
+## Installeren (als mks)
+
+`qidi` heeft geen sudo, dus je installeert als `mks`. `/home/mks` is op de Q2 een snelkoppeling naar `/home/qidi`, waar `mks` niet mag schrijven. Upload daarom naar `/tmp`. Op je pc, in de map boven `q2-spoolbridge` (vervang `<printer>` door de hostnaam of het IP-adres):
+
+```bash
+scp -r q2-spoolbridge mks@<printer>:/tmp/
+```
+
+Daarna op de printer, als `mks`:
+
+```bash
+cd /tmp/q2-spoolbridge && bash install.sh
+```
+
+Doe daarna in Fluidd een **RESTART** terwijl er niets print.
+
+Het script:
+- bewaart een volledige kopie in `/opt/spoolbridge`;
+- zet de include vóór het `SAVE_CONFIG`-blok, met eerst een backup (`printer.cfg.spoolbridge.bak`);
+- behoudt de eigenaar en de rechten van je configbestanden;
+- doet een proefdraai voordat het de dienst start.
+
+Je kunt het gerust opnieuw uitvoeren.
+
+**Na een QIDI-update:** `bash /opt/spoolbridge/install.sh`.
+**Na een volledige herflash:** opnieuw uploaden vanaf je pc.
+
+## Slot koppelen aan een spoel
+
+1. Open in Fluidd de Spoolman-kaart. Elke slotmacro (`Q2_SLOT1` … `Q2_SLOT4`, `Q2_EXTERN`) krijgt een spoelkiezer.
+2. Kies per slot de spoel. Fluidd bewaart dat in `saved_variables.cfg`, dus het overleeft een herstart.
+3. Laadt de box `slot0`, dan wordt de spoel van `Q2_SLOT1` actief, enzovoort.
+
+| Box-slot | Macro | Op het scherm |
+|---|---|---|
+| slot0–3 | Q2_SLOT1–4 | slot 1–4 |
+| slot4–7 | Q2_BOX2_SLOT1–4 | tweede box (in `spoolbridge.cfg` uit commentaar halen) |
+| slot16 | Q2_EXTERN | externe houder |
+
+## Gedrag
+
+- QIDI meldt `slot16` ook als de toolhead leeg is. spoolbridge telt `slot16` daarom alleen als geladen als de filamentsensor in de toolhead filament ziet.
+- De box laadt filament pas in de toolhead bij de printstart of een wissel. Op dat moment wisselt de actieve spoel.
+- Is het geladen slot niet gekoppeld, dan maakt spoolbridge de actieve spoel **leeg**.
+- Het slot is leidend: een handmatig gekozen spoel zet spoolbridge binnen een seconde terug.
+- Logs: `sudo journalctl -u spoolbridge -f`
+- Verwijderen: `bash /opt/spoolbridge/install.sh --uninstall`
+
+Niet gelieerd aan QIDI. Gebruik op eigen risico. Licentie: GPL-3.0-or-later.
+
+---
+
+*Ontwikkeld met behulp van [Claude](https://claude.ai) (Anthropic), een AI-assistent. Alle code is nagekeken en getest op een echte Q2.*

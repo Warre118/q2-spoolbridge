@@ -1,0 +1,121 @@
+# q2-spoolbridge
+
+**Spoolman integration for the QIDI Q2 with QIDI Box that works with the new firmware (01.01.03.x).**
+
+spoolbridge automatically sets the right spool as active in Moonraker, based on the slot the QIDI Box has loaded. Moonraker then tracks filament usage and reports it to Spoolman as usual. You assign a spool to each box slot in Fluidd, just like before.
+
+> **Status: beta.** Tested on a Q2 with one QIDI Box, firmware 01.01.03.x. Not yet confirmed: whether `loaded_slot` changes exactly at every tool change in a multi-colour print. Please report your results in the issues.
+
+## Why
+
+Since the recent QIDI firmware, every tool change goes through QIDI's `T_MANAGER`. The common community approach overrides `T0`–`T3` with custom macros that call `EXTRUDER_LOAD` directly. That bypasses QIDI's own bookkeeping, and **the QIDI Box gets out of sync** with the printer (which can mean re-flashing and reconfiguring the box).
+
+spoolbridge does **not** touch tool changes. It only **watches** `multi_color_controller.box.loaded_slot` through the Moonraker API and sets the active spool. It never sends G-code, never overrides QIDI macros and never operates the box. It also follows auto-refill, because it looks at the loaded slot, not at the T number.
+
+## Files
+
+| File | Goes to |
+|---|---|
+| `spoolbridge.py` | `/opt/spoolbridge/` (the service, Python 3.9, standard library only) |
+| `spoolbridge.service` | `/etc/systemd/system/` (runs unprivileged with `DynamicUser`) |
+| `spoolbridge.cfg` | `~/printer_data/config/customizations/` (empty Fluidd macros, one per slot) |
+| `install.sh` | install, restore after an update, and `--uninstall` |
+
+## Requirements
+
+- QIDI Q2 with QIDI Box, firmware 01.01.03.x (with `T_MANAGER`).
+- Spoolman configured in `moonraker.conf` (`[spoolman]` section) and working in Fluidd.
+- SSH access as a user with `sudo`. On the Q2 that is `mks`; `qidi` has no sudo.
+
+## Install
+
+On the Q2, `/home/mks` is a symlink to `/home/qidi`, and `mks` cannot write there, so upload to `/tmp`. On your PC, in the folder that contains `q2-spoolbridge` (replace `<printer>` with your printer's hostname or IP):
+
+```bash
+scp -r q2-spoolbridge mks@<printer>:/tmp/
+```
+
+Then on the printer, as `mks`:
+
+```bash
+cd /tmp/q2-spoolbridge && bash install.sh
+```
+
+Then do a **RESTART** in Fluidd while the printer is idle, so Klipper loads the macros `Q2_SLOT1..4` and `Q2_EXTERN`.
+
+The installer:
+- keeps a full copy in `/opt/spoolbridge`;
+- adds `[include customizations/spoolbridge.cfg]` before the `SAVE_CONFIG` block of `printer.cfg`, after making a backup (`printer.cfg.spoolbridge.bak`);
+- keeps the owner and mode of your config files, so Fluidd and `SAVE_CONFIG` keep working;
+- does a dry run before starting the service.
+
+Running it again is safe.
+
+**After a QIDI update:** `bash /opt/spoolbridge/install.sh`.
+**After a full re-flash:** `/opt` is gone too, so upload again from your PC.
+
+## Assign spools to slots
+
+1. In Fluidd, open the Spoolman card. Each slot macro (`Q2_SLOT1` … `Q2_SLOT4`, `Q2_EXTERN`) gets a spool selector.
+2. Pick the spool for each slot. Fluidd stores the choice in `saved_variables.cfg` as `q2_slot1__spool_id`, so it survives a restart.
+3. Done. When the box loads `slot0`, the spool of `Q2_SLOT1` becomes active, and so on.
+
+| Box slot | Macro | On the screen |
+|---|---|---|
+| slot0 | Q2_SLOT1 | slot 1 |
+| slot1 | Q2_SLOT2 | slot 2 |
+| slot2 | Q2_SLOT3 | slot 3 |
+| slot3 | Q2_SLOT4 | slot 4 |
+| slot4–7 | Q2_BOX2_SLOT1–4 | second box (uncomment in `spoolbridge.cfg`) |
+| slot16 | Q2_EXTERN | external holder |
+
+**Optional:** set `SPOOLBRIDGE_LOCATION_PREFIX=Q2 ` in the service. A slot without a Fluidd assignment then falls back to the Spoolman spool with location `Q2 slot1` … `Q2 slot4` or `Q2 extern`.
+
+## Behaviour
+
+- QIDI reports `loaded_slot = slot16` even when the toolhead is empty. spoolbridge therefore only treats `slot16` as loaded when the toolhead filament sensor sees filament.
+- The box loads filament into the toolhead only at print start or at a tool change, so the active spool changes at those moments, not when you insert a spool in the box.
+- If the loaded slot has no spool assigned, spoolbridge **clears** the active spool. Better to book nothing than to book on the wrong spool.
+- If you set a different active spool by hand in Fluidd, spoolbridge sets it back within a second. The slot is leading.
+- Logs: `sudo journalctl -u spoolbridge -f`
+- Test without writing: `python3 /opt/spoolbridge/spoolbridge.py --dry-run`
+
+## Configuration
+
+Environment variables in `spoolbridge.service`:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `SPOOLBRIDGE_MOONRAKER` | `http://127.0.0.1:7125` | Moonraker URL |
+| `SPOOLBRIDGE_POLL` | `1.0` | poll interval in seconds |
+| `SPOOLBRIDGE_LOCATION_PREFIX` | empty | Spoolman location fallback (see above) |
+
+The installer accepts `SPOOLBRIDGE_CFG_DIR` if your config is not in `/home/qidi/printer_data/config`.
+
+## Uninstall
+
+```bash
+bash /opt/spoolbridge/install.sh --uninstall
+```
+
+This removes the service and the include. The macro file stays in place.
+
+## Tests
+
+```bash
+python3 tests/test_spoolbridge.py
+```
+
+These are offline tests with a fake Moonraker; they need no printer.
+
+## Disclaimer
+
+Not affiliated with QIDI. Use at your own risk. spoolbridge only reads printer state and sets Moonraker's active spool, but you are modifying your printer's configuration.
+
+## License
+
+GPL-3.0-or-later, see [LICENSE](LICENSE). A Dutch README is available in [README.nl.md](README.nl.md).
+
+---
+
+*Developed with the help of [Claude](https://claude.ai) (Anthropic), an AI assistant. All code was reviewed and tested on a real Q2.*
